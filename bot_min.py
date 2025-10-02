@@ -143,7 +143,7 @@ def gen_cover_ai(title: str) -> Optional[bytes]:
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Локальная красивая обложка (градиент, звёзды, «силуэт героя»)
+# Локальная обложка — фикс для Pillow: xy как ((x0,y0),(x1,y1))
 # ──────────────────────────────────────────────────────────────────────────────
 def _draw_gradient(draw: ImageDraw.ImageDraw, w: int, h: int):
     top = (245, 245, 255); bottom = (220, 230, 255)
@@ -154,13 +154,13 @@ def _draw_gradient(draw: ImageDraw.ImageDraw, w: int, h: int):
         b = int(top[2]*(1-t) + bottom[2]*t)
         draw.line([(0, y), (w, y)], fill=(r,g,b))
 
-def _star(draw: ImageDraw.ImageDraw, x, y, size, fill):  # простые «звёздочки»
+def _star(draw: ImageDraw.ImageDraw, x, y, size, fill):
     r = size
     for i in range(5):
         ang = i * 72 * math.pi/180
         x1 = x + r * math.cos(ang)
         y1 = y + r * math.sin(ang)
-        draw.ellipse((x1-2, y1-2, x1+2, y1+2), fill=fill)
+        draw.ellipse(((x1-2, y1-2), (x1+2, y1+2)), fill=fill)
 
 def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
     W, H = 1024, 1440
@@ -169,18 +169,18 @@ def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
 
     _draw_gradient(d, W, H)
     pad = 28
-    d.rounded_rectangle((pad,pad,W-pad,H-pad), radius=28, outline=(70,90,200), width=6)
-    d.ellipse((W-220, 80, W-120, 180), fill=(255,240,200))
+    d.rounded_rectangle(((pad, pad), (W-pad, H-pad)), radius=28, outline=(70,90,200), width=6)
+    d.ellipse(((W-220, 80), (W-120, 180)), fill=(255,240,200))
     for sx in range(100, W-250, 140):
         _star(d, sx, 140 + (sx//140)%70, 8, fill=(255,255,220))
-    d.pieslice((-100, H-460, W+100, H+300), 0, 180, fill=(210,225,250))
+    d.pieslice(((-100, H-460), (W+100, H+300)), 0, 180, fill=(210,225,250))
 
     # «герой»
     base_x, base_y = W//2 - 80, H - 360
-    d.rounded_rectangle((base_x, base_y, base_x+160, base_y+120), radius=60, fill=(90,110,160))
+    d.rounded_rectangle(((base_x, base_y), (base_x+160, base_y+120)), radius=60, fill=(90,110,160))
     d.polygon([(base_x+20, base_y), (base_x+60, base_y-40), (base_x+80, base_y)], fill=(90,110,160))
     d.polygon([(base_x+140, base_y), (base_x+100, base_y-40), (base_x+80, base_y)], fill=(90,110,160))
-    d.rounded_rectangle((base_x+150, base_y+40, base_x+190, base_y+60), radius=10, fill=(90,110,160))
+    d.rounded_rectangle(((base_x+150, base_y+40), (base_x+190, base_y+60)), radius=10, fill=(90,110,160))
 
     # заголовок
     title = (title or "Сказка").strip()
@@ -220,7 +220,7 @@ def make_cover_png_bytes(title: str, hero: str) -> bytes:
     return raw if raw is not None else gen_cover_local(title, hero_hint=hero)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STORY (ИИ или локально — чистый русский текст, без «(ась)/(ёл)»)
+# STORY (ИИ или локально)
 # ──────────────────────────────────────────────────────────────────────────────
 def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, Any]:
     if oa_client:
@@ -231,10 +231,9 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
 Герой: {hero}. Идея/мораль: {moral}.
 Требования:
 - Объём: {target_len}
-- Язык: русский, никакой записи вида "(ась)/(ёл)" — нормальные формы слов.
-- 3–5 коротких абзацев + отдельный блок «Мораль»
-- Затем 4 вопроса для обсуждения
-Ответ строго в JSON: {{ "title": "...", "text": "...", "moral": "...", "questions": ["...", "...", "...", "..."] }}
+- Язык: русский, без форм типа "(ась)/(ёл)".
+- 3–5 абзацев + блок «Мораль» + 4 вопроса.
+Ответ строго JSON: {{"title":"...","text":"...","moral":"...","questions":["...","...","...","..."]}}
 """
             resp = oa_client.responses.create(model=os.getenv("OPENAI_MODEL_TEXT","gpt-4.1-mini"), input=prompt)
             data = json.loads(resp.output_text or "{}")
@@ -371,10 +370,8 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧚‍♀️ Сказка", url=f"https://t.me/{u}?start=story"),
          InlineKeyboardButton("🧮 Математика", url=f"https://t.me/{u}?start=math")],
         [InlineKeyboardButton("👪 Отчёт", url=f"https://t.me/{u}?start=parent"),
-         InlineKeyboardButton("🗑 Удалить данные", url=f=https_url(f"https://t.me/{u}?start=delete"))],
+         InlineKeyboardButton("🗑 Удалить данные", url=f"https://t.me/{u}?start=delete")],
     ])
-
-def https_url(u: str) -> str: return u  # заглушка на случай линтеров
 
 def menu_text() -> str:
     return (
