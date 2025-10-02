@@ -1,29 +1,25 @@
 # -*- coding: utf-8 -*-
-# Читалкин&Циферкин — сказки + PDF (Unicode) + обложка (ИИ или локальная) + webhook/polling
+# Читалкин&Циферкин — сказки + PDF (Unicode) + локальная/ИИ-обложка + webhook/polling
 
 import os, json, random, base64, tempfile, math
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
-
 from zoneinfo import ZoneInfo
+
 from PIL import Image, ImageDraw, ImageFont
 from fpdf import FPDF
 
-from telegram import (
-    Update, InputFile, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
-)
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters
-)
+from telegram import Update, InputFile, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV
 # ──────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "ВСТАВЬ_СЮДА_СВОЙ_BOT_TOKEN")
-PUBLIC_URL   = os.getenv("PUBLIC_URL")      # напр. https://chitalkin-bot.onrender.com
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")    # напр. hook
+PUBLIC_URL   = os.getenv("PUBLIC_URL")         # напр. https://chitalkin-bot.onrender.com
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")       # напр. hook
 PORT         = int(os.getenv("PORT", "8080"))
 
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
@@ -50,7 +46,7 @@ STATS_PATH   = DATA_DIR / "stats.json"
 STORIES_PATH = DATA_DIR / "stories.json"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FONTS (обязательно положи TTF в ./fonts)
+# FONTS (положи в ./fonts два файла TTF)
 # ──────────────────────────────────────────────────────────────────────────────
 FONT_DIR  = Path("fonts")
 FONT_REG  = FONT_DIR / "DejaVuSans.ttf"
@@ -136,14 +132,14 @@ def gen_cover_ai(title: str) -> Optional[bytes]:
             f"A warm, cozy children's book cover for Russian tale «{title}». "
             "Soft pastel colors, cute illustration, no text on image."
         )
-        img = oa_client.images.generate(model=os.getenv("OPENAI_MODEL_IMAGE","gpt-image-1"), prompt=prompt, size="1024x1440")
+        img = oa_client.images.generate(model=OPENAI_MODEL_IMG, prompt=prompt, size="1024x1440")
         return base64.b64decode(img.data[0].b64_json)
     except Exception as e:
         print(f"[AI] image error: {type(e).__name__}: {e} — fallback to local cover")
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Локальная обложка — фикс для Pillow: xy как ((x0,y0),(x1,y1))
+# Локальная обложка — ВЕЗДЕ координаты как ((x0, y0), (x1, y1))
 # ──────────────────────────────────────────────────────────────────────────────
 def _draw_gradient(draw: ImageDraw.ImageDraw, w: int, h: int):
     top = (245, 245, 255); bottom = (220, 230, 255)
@@ -175,7 +171,7 @@ def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
         _star(d, sx, 140 + (sx//140)%70, 8, fill=(255,255,220))
     d.pieslice(((-100, H-460), (W+100, H+300)), 0, 180, fill=(210,225,250))
 
-    # «герой»
+    # «герой» — все координаты парные
     base_x, base_y = W//2 - 80, H - 360
     d.rounded_rectangle(((base_x, base_y), (base_x+160, base_y+120)), radius=60, fill=(90,110,160))
     d.polygon([(base_x+20, base_y), (base_x+60, base_y-40), (base_x+80, base_y)], fill=(90,110,160))
@@ -193,7 +189,8 @@ def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
     words = title.split(); lines, cur = [], ""
     for w in words:
         test = (cur + " " + w).strip()
-        if d.textlength(test, font=font_title) <= max_w:
+        width = d.textlength(test, font=font_title)
+        if width <= max_w:
             cur = test
         else:
             if cur: lines.append(cur)
@@ -231,11 +228,11 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
 Герой: {hero}. Идея/мораль: {moral}.
 Требования:
 - Объём: {target_len}
-- Язык: русский, без форм типа "(ась)/(ёл)".
+- Язык: русский, без форм "(ась)/(ёл)".
 - 3–5 абзацев + блок «Мораль» + 4 вопроса.
-Ответ строго JSON: {{"title":"...","text":"...","moral":"...","questions":["...","...","...","..."]}}
+Ответ СТРОГО JSON: {{"title":"...","text":"...","moral":"...","questions":["...","...","...","..."]}}
 """
-            resp = oa_client.responses.create(model=os.getenv("OPENAI_MODEL_TEXT","gpt-4.1-mini"), input=prompt)
+            resp = oa_client.responses.create(model=OPENAI_MODEL_TEXT, input=prompt)
             data = json.loads(resp.output_text or "{}")
             return {
                 "title": data.get("title") or f"{hero.capitalize()} и урок про «{moral}»",
@@ -295,20 +292,14 @@ class StoryPDF(FPDF):
 
 def _ensure_unicode_fonts(pdf: FPDF) -> bool:
     try:
-        print(f"[PDF] fonts dir: {FONT_DIR.resolve()}")
-        if not FONT_DIR.exists():
-            print("[PDF] fonts/ directory NOT found")
-            return False
-        print(f"[PDF] contents: {list(p.name for p in FONT_DIR.iterdir())}")
         if not (FONT_REG.exists() and FONT_BOLD.exists()):
-            print("[PDF] DejaVu TTF files NOT found (need DejaVuSans.ttf & DejaVuSans-Bold.ttf)")
+            print("[PDF] DejaVu TTF files NOT found (need fonts/DejaVuSans*.ttf)")
             return False
         pdf.add_font(PDF_FONT,   "", str(FONT_REG),  uni=True)
         pdf.add_font(PDF_FONT_B, "", str(FONT_BOLD), uni=True)
-        print("[PDF] loaded Unicode fonts: OK")
         return True
     except Exception as e:
-        print(f"[PDF] TTF load error: {e} — fallback to Helvetica")
+        print(f"[PDF] TTF load error: {e}")
         return False
 
 def render_story_pdf(path: Path, data: Dict[str, Any], cover_png: Optional[bytes]):
@@ -320,8 +311,7 @@ def render_story_pdf(path: Path, data: Dict[str, Any], cover_png: Optional[bytes
     pdf.add_page()
     if cover_png:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp.write(cover_png); tmp.flush()
-            tmp_name = tmp.name
+            tmp.write(cover_png); tmp.flush(); tmp_name = tmp.name
         try:
             pdf.image(tmp_name, x=0, y=0, w=210, h=297)
         finally:
@@ -332,7 +322,7 @@ def render_story_pdf(path: Path, data: Dict[str, Any], cover_png: Optional[bytes
         else:       pdf.set_font("Helvetica", style="B", size=26)
         pdf.set_y(40); pdf.multi_cell(0, 12, data["title"], align="C")
 
-    # TEXT page
+    # TEXT
     pdf.add_page()
     if use_uni: pdf.set_font(PDF_FONT_B, size=16)
     else:       pdf.set_font("Helvetica", style="B", size=16)
@@ -465,12 +455,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = synthesize_story(p["age"], p["hero"], p["moral"], p["length"])
         inc_story_counters(uid, data["title"])
 
-        # cover
+        # cover → bytes
         cover_bytes = make_cover_png_bytes(data["title"], p["hero"])
         data["cover_png_bytes"] = cover_bytes
         store_user_story(uid, {k: v for k, v in data.items() if k != "cover_png_bytes"})
 
-        # text to chat
+        # text
         msg = (
             f"🧾 {data['title']}\n\n{data['text']}\n\n"
             f"Мораль: {data['moral']}\n\n"
