@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
-# Читалкин&Циферкин — версия без картинок (только текст и PDF)
-# • Без генерации и отправки обложек
-# • PDF: титульная страница рисуется средствами FPDF (без изображений)
-# • Настройки: возраст, герой, длина, стиль сказки, список «избегать»
-# • Лимит сказок выключен по умолчанию (DISABLE_LIMIT=1)
+# Читалкин&Циферкин — ТЕКСТ-ТОЛЬКО: качественные сказки с жёстким контролем смысла и длины
+# • Картинок нет. Только текст + PDF.
+# • Генерация: outline → draft → critique&revise → проверка объёма.
+# • Длину можно задавать: короткая (250–400), средняя (450–700), длинная (800–1100).
+# • Настройки: возраст, герой, длина по умолчанию, стиль, «избегать».
 
-import os, json, random, tempfile, traceback
+import os, json, random, re, traceback
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fpdf import FPDF
@@ -23,13 +23,13 @@ PUBLIC_URL   = os.getenv("PUBLIC_URL")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")
 PORT         = int(os.getenv("PORT", "8080"))
 
-# лимиты: отключены для теста
+# лимит отключён для тестов
 DISABLE_LIMIT = os.getenv("DISABLE_LIMIT", "1") == "1"
 MAX_STORIES_PER_DAY = 10**9 if DISABLE_LIMIT else int(os.getenv("MAX_STORIES_PER_DAY", "3"))
 
 ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")
 
-# опционально можно подключить OpenAI для текста
+# OpenAI (только для текста; опционально)
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_TEXT = os.getenv("OPENAI_MODEL_TEXT", "gpt-4.1-mini")
 try:
@@ -39,7 +39,7 @@ except Exception:
     oa_client = None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONST / STORAGE
+# STORAGE
 # ──────────────────────────────────────────────────────────────────────────────
 TZ_MSK = ZoneInfo("Europe/Moscow")
 DATA_DIR     = Path(".")
@@ -54,10 +54,6 @@ PDF_FONT_B = "DejaVuB"
 
 def msk_now() -> datetime: return datetime.now(TZ_MSK)
 def msk_today_str() -> str: return msk_now().strftime("%Y-%m-%d")
-def seconds_to_midnight_msk() -> int:
-    now = msk_now()
-    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return int((tomorrow - now).total_seconds())
 
 def load_json(p: Path) -> Dict[str, Any]:
     if p.exists():
@@ -74,23 +70,19 @@ stories_all: Dict[str, Dict[str, Any]] = load_json(STORIES_PATH)
 
 def default_stats() -> Dict[str, Any]:
     return {
-        "stories_total": 0,
-        "math_total": 0,
-        "today_date": msk_today_str(),
-        "today_stories": 0,
-        "last_story_ts": None,
-        "last_story_title": None,
+        "stories_total": 0, "math_total": 0,
+        "today_date": msk_today_str(), "today_stories": 0,
+        "last_story_ts": None, "last_story_title": None,
     }
 
 def default_user_stories() -> Dict[str, Any]:
     return {
-        "last": None,
-        "history": [],
+        "last": None, "history": [],
         "profile": {
             "age": 6,
             "hero": "котёнок",
-            "length": "средняя",
-            "style": "классика",   # классика / приключение / детектив / фантазия / научпоп
+            "length": "средняя",            # короткая/средняя/длинная
+            "style": "классика",            # классика/приключение/детектив/фантазия/научпоп
             "avoid": []
         },
     }
@@ -134,93 +126,197 @@ def store_user_story(uid: int, story: Dict[str, Any]):
     stories_all[str(uid)] = rec; save_json(STORIES_PATH, stories_all)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STORY: локальная генерация (+ опционально OpenAI для улучшений)
+# ДЛИНА/ВОЗРАСТ/СТИЛЬ
 # ──────────────────────────────────────────────────────────────────────────────
 STORY_STYLES = {
-    "классика":  "добрая классическая сказка с ясной моралью",
-    "приключение": "динамичное приключение с мини-препятствиями и взаимопомощью",
-    "детектив":  "лёгкий детский детектив: загадка → подсказки → добрый финал",
-    "фантазия":  "волшебная история с мягким чудом и необычными существами",
-    "научпоп":   "познавательная история, герой открывает простое правило/эффект",
+    "классика":   "добрая классическая сказка с ясной моралью",
+    "приключение":"динамичное детское приключение с мини-препятствиями и взаимопомощью",
+    "детектив":   "лёгкий детский детектив: загадка → подсказки → добрый финал",
+    "фантазия":   "волшебная история с мягким чудом и необычными существами",
+    "научпоп":    "познавательная история: герой открывает простое правило/эффект",
 }
 
+LEN_BANDS = {
+    "короткая": (250, 400),
+    "средняя":  (450, 700),
+    "длинная":  (800, 1100),
+}
+
+def word_count_ru(text: str) -> int:
+    # грубо, но стабильно для контроля диапазона
+    return len(re.findall(r"[А-Яа-яЁёA-Za-z0-9-]+", text))
+
+def within_band(text: str, band: Tuple[int,int]) -> bool:
+    wc = word_count_ru(text)
+    return band[0] <= wc <= band[1]
+
+def clamp_to_band_locally(text: str, band: Tuple[int,int]) -> str:
+    # Если длиннее — мягко урезаем последние предложения; если короче — слегка расширяем связками.
+    wc = word_count_ru(text)
+    if wc > band[1]:
+        parts = re.split(r"(\n\n+)", text)  # абзацы
+        while word_count_ru("".join(parts)) > band[1] and len(parts) > 1:
+            parts = parts[:-1]  # убираем финальную реплику/абзац
+        text = "".join(parts)
+        # если всё ещё длинно — отрежем последние предложения
+        sents = re.split(r"(?<=[\.\!\?])\s+", text)
+        while word_count_ru(" ".join(sents)) > band[1] and len(sents) > 3:
+            sents = sents[:-1]
+        return " ".join(sents)
+    if wc < band[0]:
+        gap = band[0] - wc
+        filler = (
+            " Малые шаги приносят большие перемены. "
+            "Когда рядом добрые люди, любое дело становится понятнее и светлее. "
+        )
+        # добавим 1–3 фразы на конце
+        need = 1 if gap < 40 else (2 if gap < 120 else 3)
+        return text.rstrip() + "\n\n" + (filler * need).strip()
+    return text
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ГЕНЕРАЦИЯ СКАЗКИ
+# ──────────────────────────────────────────────────────────────────────────────
 def _avoid_filter(text: str, avoid: List[str]) -> str:
     if not avoid: return text
     for w in [a.strip() for a in avoid if a.strip()]:
-        text = text.replace(w, "🌟")
+        text = re.sub(re.escape(w), "🌟", text, flags=re.IGNORECASE)
     return text
 
-def _target_len(length: str) -> int:
-    return {"короткая": 3, "средняя": 4, "длинная": 5}.get((length or "").lower(), 4)
-
-def _local_story(age: int, hero: str, moral: str, length: str, style: str, avoid: List[str]) -> Dict[str, Any]:
-    hero = hero or "герой"
+def _local_story(age: int, hero: str, moral: str, target_band: Tuple[int,int], style: str, avoid: List[str]) -> Dict[str, Any]:
+    # Локальный разумный генератор: простая дуга «цель → попытки → развязка», 3–5 абзацев, целевая длина.
+    hero  = hero or "герой"
     moral = moral or "доброта"
     style_note = STORY_STYLES.get(style, STORY_STYLES["классика"])
 
-    starts = [
-        f"Жил-был {hero}, который очень хотел разобраться, что такое {moral}.",
-        f"Однажды {hero} проснулся и решил искать {moral} в своих делах.",
-        f"С утра {hero} понял: сегодня он узнает, почему {moral} важна.",
-    ]
-    middles = [
-        f"По пути {hero} встретил(а) друзей, и вместе они помогали тем, кто просил.",
-        f"Иногда было трудно, но каждый маленький шаг делал день светлее.",
-        f"Ветер шуршал в листве, пахло мёдом и травами, а сердце {hero} теплело.",
-        f"Крошечные добрые поступки отражались, как солнечные зайчики в окнах.",
-        f"Они решали маленькие загадки и учились слушать друг друга.",
-    ]
-    endings = [
-        f"К вечеру {hero} понял(а): {moral} — это то, что делают, а не просто говорят.",
-        f"И {hero} улыбнулся(ась): {moral} живёт в заботе и внимании.",
-        f"С тех пор {hero} запомнил(а): {moral} согревает даже в холодный день.",
-    ]
+    def sent_pool():
+        starts = [
+            f"Жил-был {hero}, который решил понять, что такое {moral}.",
+            f"Однажды {hero} проснулся и загадал день, в котором {moral} станет видна.",
+            f"С раннего утра {hero} чувствовал, что сегодня научится замечать {moral}.",
+        ]
+        tries = [
+            f"{hero.capitalize()} помогал тем, кто рядом, и замечал, как меняется настроение.",
+            f"Иногда было трудно, но маленькие шаги давали смелость продолжать.",
+            f"Друзья поддерживали, и вместе они находили простые ответы.",
+            f"Каждая добрая мысль превращалась в тихое действие — и становилось светлее.",
+        ]
+        reveals = [
+            f"К вечеру {hero} понял: {moral} — это не слово, а поступок, который согревает.",
+            f"Возвращаясь домой, {hero} улыбался: {moral} живёт в заботе и внимании.",
+            f"Так {hero} запомнил: если делишься теплом, {moral} становится заметной для всех.",
+        ]
+        return starts, tries, reveals
 
-    n_par = _target_len(length)
-    body = [random.choice(starts)]
-    while len(body) < n_par - 1:
-        body.append(random.choice(middles))
-    body.append(random.choice(endings))
+    start_pool, try_pool, reveal_pool = sent_pool()
+    paras = [random.choice(start_pool)]
+    paras += random.sample(try_pool, k=2)
+    paras.append(random.choice(try_pool))
+    paras.append(random.choice(reveal_pool))
 
-    text = "\n\n".join(body)
+    # Сборка, затем расширение/сжатие под диапазон
+    text = "\n\n".join(paras)
+    text = clamp_to_band_locally(text, target_band)
     text = _avoid_filter(text, avoid)
 
     title = f"{hero.capitalize()} и урок про «{moral}»"
     questions = [
-        f"Что {hero} узнал(а) про {moral}?",
-        "Какие шаги помогли героям двигаться дальше?",
+        f"Что {hero} понял про {moral}?",
+        "Какие шаги помогли героям продвинуться?",
         "Где в истории чувствовалась дружба?",
-        "Что бы ты сделал(а) на месте героя?",
+        "Как бы ты поступил(а) на месте героя?",
     ]
-    return {"title": title, "text": text, "moral": f"Важно помнить: {moral}.", "questions": questions, "style_note": style_note}
+    moral_txt = f"Важно помнить: {moral}. Даже маленькое добро меняет день."
+    return {"title": title, "text": text, "moral": moral_txt, "questions": questions, "style_note": style_note}
+
+def _json_from_response(resp) -> Dict[str, Any]:
+    try:
+        return json.loads(resp.output_text or "{}")
+    except Exception:
+        return {}
 
 def synthesize_story(age: int, hero: str, moral: str, length: str, avoid: List[str], style: str) -> Dict[str, Any]:
-    data = _local_story(age, hero, moral, length, style, avoid)
+    band = LEN_BANDS.get((length or "").lower(), LEN_BANDS["средняя"])
+    hero  = hero or "герой"
+    moral = moral or "доброта"
+    style_note = STORY_STYLES.get(style, STORY_STYLES["классика"])
 
-    # если есть OpenAI — мягко отполируем текст (без картинок)
-    if oa_client:
-        try:
-            prompt = f"""
-Улучшить текст сказки для ребёнка {age} лет: сделать немного образнее,
-но сохранить простоту и доброту. Не добавлять взрослые темы и сложную лексику.
-Верни JSON {{"text":"...","moral":"...","questions":[...]}}. Исходник:
-{json.dumps({"text": data["text"], "moral": data["moral"], "questions": data["questions"]}, ensure_ascii=False)}
+    # Если нет OpenAI — локальный генератор с контролем длины:
+    if not oa_client:
+        return _local_story(age, hero, moral, band, style, avoid)
+
+    # 1) План
+    try:
+        prompt1 = f"""
+Ты — детский редактор и писатель. Сделай план сказки (outline) для ребёнка {age} лет.
+Стиль: {style_note}. Герой: {hero}. Главная идея/мораль: {moral}. Тем избегать: {", ".join(avoid) or "нет"}.
+Структура: завязка → 3–4 сцены (цель, препятствие, решение) → светлая развязка → чёткая мораль.
+Ответ строго JSON: {{"title":"...","scenes":[{{"name":"...","beats":["...","..."]}}]}}
 """
-            resp = oa_client.responses.create(model=OPENAI_MODEL_TEXT, input=prompt)
-            try:
-                js = json.loads(resp.output_text or "{}")
-                if isinstance(js, dict) and js.get("text"):
-                    data["text"] = _avoid_filter(js["text"], avoid)
-                    data["moral"] = js.get("moral", data["moral"])
-                    qs = js.get("questions"); 
-                    if isinstance(qs, list) and len(qs) >= 4:
-                        data["questions"] = qs[:4]
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[AI text] skip polishing: {e}")
+        r1 = oa_client.responses.create(model=OPENAI_MODEL_TEXT, input=prompt1)
+        outline = _json_from_response(r1)
+        title = outline.get("title") or f"{hero.capitalize()} и урок про «{moral}»"
+    except Exception as e:
+        print("[AI outline]", e)
+        return _local_story(age, hero, moral, band, style, avoid)
 
-    return data
+    # 2) Черновик по плану
+    try:
+        prompt2 = f"""
+Напиши связную сказку на русском для ребёнка {age} лет по плану ниже.
+План: {json.dumps(outline, ensure_ascii=False)}
+Требования:
+- Объём: {band[0]}–{band[1]} слов, соблюдай диапазон.
+- Язык: простой и тёплый, без взрослой лексики, без форм "(ась)/(ёл)".
+- Структура: 3–6 абзацев, каждый логически ведёт к следующему.
+- В конце блок "Мораль" (1–2 фразы) и 4 вопроса ребёнку.
+Ответ строго JSON: {{"text":"...","moral":"...","questions":["...","...","...","..."]}}
+"""
+        r2 = oa_client.responses.create(model=OPENAI_MODEL_TEXT, input=prompt2)
+        draft = _json_from_response(r2)
+        text = draft.get("text","")
+        moral_txt = draft.get("moral") or f"Важно помнить: {moral}."
+        questions = draft.get("questions") or [
+            f"Что {hero} понял про {moral}?", "Какие шаги помогли героям?",
+            "Где в истории дружба?", "Как бы ты поступил(а)?"
+        ]
+    except Exception as e:
+        print("[AI draft]", e)
+        return _local_story(age, hero, moral, band, style, avoid)
+
+    # 3) Критика и правка (если вышли за диапазон или нарушены требования)
+    try:
+        needs_fix = False
+        if not within_band(text, band): needs_fix = True
+        # Мини-чеклист: должна быть цель героя, препятствия, развязка, явная мораль.
+        checklist = [
+            ("цель героя", re.search(r"хочет|решил|мечтал|цель", text, re.IGNORECASE)),
+            ("препятствие/трудности", re.search(r"трудн|препятств|не просто|мешал", text, re.IGNORECASE)),
+            ("развязка/вывод", re.search(r"к вечеру|в конце|понял|итог|вывод", text, re.IGNORECASE)),
+        ]
+        if any(v is None for _, v in checklist): needs_fix = True
+
+        if needs_fix:
+            prompt3 = f"""
+Отредактируй сказку для ребёнка {age} лет так, чтобы она была связной и в диапазоне {band[0]}–{band[1]} слов.
+Соблюдай: цель героя → препятствия → решения → светлая развязка + явная мораль.
+Сделай язык тёплым и простым. Не используй взрослые темы.
+Верни строго JSON {{"text":"...","moral":"...","questions":[...]}}, 4 вопроса обязательно.
+Исходный JSON: {json.dumps({"text": text, "moral": moral_txt, "questions": questions}, ensure_ascii=False)}
+"""
+            r3 = oa_client.responses.create(model=OPENAI_MODEL_TEXT, input=prompt3)
+            data = _json_from_response(r3)
+            text = data.get("text", text)
+            moral_txt = data.get("moral", moral_txt)
+            questions = (data.get("questions") or questions)[:4]
+    except Exception as e:
+        print("[AI revise]", e)
+
+    # Страховка по длине (локально)
+    text = clamp_to_band_locally(text, band)
+    text = _avoid_filter(text, avoid)
+
+    return {"title": title, "text": text, "moral": moral_txt, "questions": questions}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PDF (без картинок)
@@ -245,25 +341,24 @@ def render_story_pdf(path: Path, data: Dict[str, Any]):
     pdf.set_auto_page_break(auto=True, margin=15)
     uni = _ensure_unicode_fonts(pdf)
 
-    # титульная страница
+    # титул
     pdf.add_page()
     pdf.set_fill_color(235, 240, 255)
     pdf.rect(0, 0, 210, 297, style="F")
-    pdf.set_draw_color(60, 80, 180)
-    pdf.set_line_width(1.2)
+    pdf.set_draw_color(60, 80, 180); pdf.set_line_width(1.2)
     pdf.rect(8, 8, 210-16, 297-16)
 
-    if uni: pdf.set_font(PDF_FONT_B, size=28)
-    else:   pdf.set_font("Helvetica", style="B", size=28)
+    if uni: pdf.set_font(PDF_FONT_B, size=26)
+    else:   pdf.set_font("Helvetica", style="B", size=26)
     pdf.set_xy(15, 60)
     pdf.multi_cell(0, 12, data["title"], align="C")
 
     if uni: pdf.set_font(PDF_FONT, size=12)
     else:   pdf.set_font("Helvetica", size=12)
-    pdf.ln(4)
-    pdf.multi_cell(0, 8, "Сказка, созданная специально для ребёнка. Без иллюстраций.", align="C")
+    meta = f"Создано: {msk_now().strftime('%d.%m.%Y')}"
+    pdf.ln(4); pdf.multi_cell(0, 8, meta, align="C")
 
-    # содержимое
+    # текст
     pdf.add_page()
     if uni: pdf.set_font(PDF_FONT_B, size=16)
     else:   pdf.set_font("Helvetica", style="B", size=16)
@@ -295,7 +390,7 @@ def render_story_pdf(path: Path, data: Dict[str, Any]):
     pdf.output(str(Path(path)))
 
 # ──────────────────────────────────────────────────────────────────────────────
-# UI + FLOW (без кнопок-меню, только команды)
+# КОМАНДЫ И ДИАЛОГ
 # ──────────────────────────────────────────────────────────────────────────────
 def _safe_int(text: str, default: int) -> int:
     try: return max(3, min(14, int(text)))
@@ -333,16 +428,12 @@ async def story_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     ustat = get_user_stats(uid)
     if not DISABLE_LIMIT and ustat["today_stories"] >= MAX_STORIES_PER_DAY:
-        secs = seconds_to_midnight_msk(); h = secs // 3600; m = (secs % 3600) // 60
-        await update.effective_message.reply_text(
-            f"На сегодня лимит исчерпан. Новый день через {h} ч {m} мин."
-        ); return
+        await update.effective_message.reply_text("На сегодня лимит исчерпан."); return
 
     prof = get_profile(uid)
     ud = context.user_data; ud.clear()
     ud["flow"] = "story"; ud["step"] = "age"; ud["params"] = {
-        "age": prof["age"], "hero": prof["hero"], "length": prof["length"],
-        "style": prof["style"]
+        "age": prof["age"], "hero": prof["hero"], "length": prof["length"], "style": prof["style"]
     }
     await update.effective_message.reply_text(
         f"Давай подберём сказку. Сколько лет ребёнку? (по умолчанию {prof['age']})"
@@ -354,9 +445,12 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_title = u.get("last_story_title") or "—"
     last_when = u.get("last_story_ts")
     if last_when:
-        try: last_when = datetime.fromisoformat(last_when).astimezone(TZ_MSK).strftime("%d.%m.%Y %H:%M")
-        except Exception: last_when = "—"
-    else: last_when = "—"
+        try:
+            last_when = datetime.fromisoformat(last_when).astimezone(TZ_MSK).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            last_when = "—"
+    else:
+        last_when = "—"
     prof = get_profile(uid)
     await update.effective_message.reply_text(
         "👪 Отчёт родителю\n\n"
@@ -392,7 +486,7 @@ async def math_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Ответы:\n" + "\n".join([f"{i+1}) {a}" for i,a in enumerate(an)]))
     inc_math_counter(uid)
 
-# текстовый диалог (settings/story)
+# текстовые шаги (settings/story)
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = context.user_data; flow = ud.get("flow"); step = ud.get("step")
     if not flow: return
@@ -407,8 +501,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prof["hero"] = text or prof.get("hero","герой"); ud["step"] = "length"
             await update.effective_message.reply_text("Длина сказки? (короткая / средняя / длинная)"); return
         if step == "length":
-            length = text.lower()
-            prof["length"] = length if length in {"короткая","средняя","длинная"} else "средняя"
+            l = text.lower(); prof["length"] = l if l in LEN_BANDS else "средняя"
             ud["step"] = "style"
             await update.effective_message.reply_text("Стиль? (классика / приключение / детектив / фантазия / научпоп)"); return
         if step == "style":
@@ -432,15 +525,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ud["moral"] = text or "доброта"; ud["step"] = "length"
             await update.effective_message.reply_text(f"Какая длина? (короткая / средняя / длинная) — по умолчанию {p.get('length','средняя')}"); return
         if step == "length":
-            length = text.lower() if text else p.get("length","средняя")
-            p["length"] = length if length in {"короткая","средняя","длинная"} else "средняя"
+            l = (text.lower() if text else p.get("length","средняя"))
+            p["length"] = l if l in LEN_BANDS else "средняя"
 
             uid = update.effective_user.id
             prof = get_profile(uid)
             ustat = get_user_stats(uid)
             if not DISABLE_LIMIT and ustat["today_stories"] >= MAX_STORIES_PER_DAY:
-                secs = seconds_to_midnight_msk(); h = secs // 3600; m = (secs % 3600) // 60
-                await update.effective_message.reply_text(f"Лимит исчерпан. Новый день через {h} ч {m} мин."); ud.clear(); return
+                await update.effective_message.reply_text("На сегодня лимит исчерпан."); ud.clear(); return
 
             data = synthesize_story(p["age"], p["hero"], ud["moral"], p["length"], avoid=prof["avoid"], style=prof["style"])
             inc_story_counters(uid, data["title"])
@@ -458,14 +550,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await update.effective_message.reply_html(msg)
 
-            # pdf без картинок
+            # pdf
             pdf_path = Path(f"skazka_{uid}.pdf").resolve()
             render_story_pdf(pdf_path, data)
             await update.effective_message.reply_document(InputFile(str(pdf_path), filename=pdf_path.name))
 
             ud.clear(); return
 
-# ошибки в алёрт-чат (если настроен)
+# ошибки → алёрт (если указан чат)
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ALERT_CHAT_ID:
         print("[ERR]", "".join(traceback.format_exception(None, context.error, context.error.__traceback__)))
