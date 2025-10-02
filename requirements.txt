@@ -1,4 +1,4 @@
-python-telegram-bot>=21,<22
-fpdf2
-pillow
-openai
+python-telegram-bot[webhooks]>=21.3,<22
+fpdf2>=2.7
+pillow>=10.4
+openai>=1.40
