@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# Читалкин&Циферкин — сказки + PDF (Unicode) + локальная/ИИ-обложка + webhook/polling
+# Читалкин&Циферкин — прод-уровень: профиль /settings, Pro, алёрты, ИИ сказки/обложки, PDF (Unicode), webhook/polling
 
-import os, json, random, base64, tempfile, math
+import os, json, random, base64, tempfile, math, traceback
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -11,23 +11,38 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont
 from fpdf import FPDF
 
-from telegram import Update, InputFile, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import (
+    Update, InputFile, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV
 # ──────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "ВСТАВЬ_СЮДА_СВОЙ_BOT_TOKEN")
-PUBLIC_URL   = os.getenv("PUBLIC_URL")         # напр. https://chitalkin-bot.onrender.com
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")       # напр. hook
+PUBLIC_URL   = os.getenv("PUBLIC_URL")              # напр. https://chitalkin-bot.onrender.com
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")            # напр. hook
 PORT         = int(os.getenv("PORT", "8080"))
 
+# Лимит: по умолчанию ОТКЛЮЧЁН для тестов (DISABLE_LIMIT=1). Поставишь 0 — вернётся ограничение.
+DISABLE_LIMIT = os.getenv("DISABLE_LIMIT", "1") == "1"
+MAX_STORIES_PER_DAY = 10**9 if DISABLE_LIMIT else int(os.getenv("MAX_STORIES_PER_DAY", "3"))
+
+# Алёрты об ошибках
+ALERT_CHAT_ID = os.getenv("ALERT_CHAT_ID")   # укажи ID чата/лички, куда слать ошибки
+
+# Pro-режим: список Telegram ID через запятую, которым включаем фичи (на будущее)
+PRO_IDS = set([int(x) for x in os.getenv("PRO_IDS", "").split(",") if x.strip().isdigit()])
+
+# OpenAI (опционально)
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_TEXT = os.getenv("OPENAI_MODEL_TEXT", "gpt-4.1-mini")
 OPENAI_MODEL_IMG  = os.getenv("OPENAI_MODEL_IMAGE", "gpt-image-1")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# OpenAI (опционально)
+# OpenAI client
 # ──────────────────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
@@ -39,14 +54,13 @@ except Exception as e:
 # ──────────────────────────────────────────────────────────────────────────────
 # CONST / STORAGE
 # ──────────────────────────────────────────────────────────────────────────────
-MAX_STORIES_PER_DAY = 3
 TZ_MSK = ZoneInfo("Europe/Moscow")
 DATA_DIR     = Path(".")
-STATS_PATH   = DATA_DIR / "stats.json"
-STORIES_PATH = DATA_DIR / "stories.json"
+STATS_PATH   = DATA_DIR / "stats.json"    # счётчики + флаги Pro
+STORIES_PATH = DATA_DIR / "stories.json"  # последние сказки + профили
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FONTS (положи в ./fonts два файла TTF)
+# FONTS
 # ──────────────────────────────────────────────────────────────────────────────
 FONT_DIR  = Path("fonts")
 FONT_REG  = FONT_DIR / "DejaVuSans.ttf"
@@ -78,17 +92,25 @@ stats_all: Dict[str, Dict[str, Any]]   = load_json(STATS_PATH)
 stories_all: Dict[str, Dict[str, Any]] = load_json(STORIES_PATH)
 
 def default_stats() -> Dict[str, Any]:
-    return {"stories_total": 0, "math_total": 0,
-            "today_date": msk_today_str(), "today_stories": 0,
-            "last_story_ts": None, "last_story_title": None}
+    return {
+        "stories_total": 0, "math_total": 0,
+        "today_date": msk_today_str(), "today_stories": 0,
+        "last_story_ts": None, "last_story_title": None,
+        "pro": False,
+    }
 
 def default_user_stories() -> Dict[str, Any]:
-    return {"last": None, "history": []}
+    return {
+        "last": None, "history": [],
+        "profile": {"age": 6, "hero": "котёнок", "length": "средняя", "avoid": []},
+    }
 
 def get_user_stats(uid: int) -> Dict[str, Any]:
     u = stats_all.get(str(uid))
     if not u:
         u = default_stats()
+        # включим pro, если задано в ENV
+        if uid in PRO_IDS: u["pro"] = True
         stats_all[str(uid)] = u
         save_json(STATS_PATH, stats_all)
     if u.get("today_date") != msk_today_str():
@@ -111,6 +133,22 @@ def inc_math_counter(uid: int):
     u["math_total"] = int(u.get("math_total", 0)) + 1
     stats_all[str(uid)] = u
     save_json(STATS_PATH, stats_all)
+
+def get_profile(uid: int) -> Dict[str, Any]:
+    rec = stories_all.get(str(uid))
+    if not rec:
+        rec = default_user_stories()
+        stories_all[str(uid)] = rec
+        save_json(STORIES_PATH, stories_all)
+    prof = rec.get("profile") or {"age":6,"hero":"котёнок","length":"средняя","avoid":[]}
+    rec["profile"] = prof
+    return prof
+
+def save_profile(uid: int, prof: Dict[str, Any]):
+    rec = stories_all.get(str(uid), default_user_stories())
+    rec["profile"] = prof
+    stories_all[str(uid)] = rec
+    save_json(STORIES_PATH, stories_all)
 
 def store_user_story(uid: int, story: Dict[str, Any]):
     rec = stories_all.get(str(uid), default_user_stories())
@@ -139,7 +177,7 @@ def gen_cover_ai(title: str) -> Optional[bytes]:
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Локальная обложка — ВЕЗДЕ координаты как ((x0, y0), (x1, y1))
+# Локальная обложка — координаты строго ((x0, y0), (x1, y1))
 # ──────────────────────────────────────────────────────────────────────────────
 def _draw_gradient(draw: ImageDraw.ImageDraw, w: int, h: int):
     top = (245, 245, 255); bottom = (220, 230, 255)
@@ -171,7 +209,7 @@ def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
         _star(d, sx, 140 + (sx//140)%70, 8, fill=(255,255,220))
     d.pieslice(((-100, H-460), (W+100, H+300)), 0, 180, fill=(210,225,250))
 
-    # «герой» — все координаты парные
+    # простая фигурка-герой
     base_x, base_y = W//2 - 80, H - 360
     d.rounded_rectangle(((base_x, base_y), (base_x+160, base_y+120)), radius=60, fill=(90,110,160))
     d.polygon([(base_x+20, base_y), (base_x+60, base_y-40), (base_x+80, base_y)], fill=(90,110,160))
@@ -217,15 +255,26 @@ def make_cover_png_bytes(title: str, hero: str) -> bytes:
     return raw if raw is not None else gen_cover_local(title, hero_hint=hero)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STORY (ИИ или локально)
+# STORY (ИИ/локально) с учётом профиля и avoid-тем
 # ──────────────────────────────────────────────────────────────────────────────
-def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, Any]:
+def _avoid_filter(text: str, avoid: List[str]) -> str:
+    if not avoid: return text
+    bad = [w.strip().lower() for w in avoid if w.strip()]
+    if not bad: return text
+    for w in bad:
+        text = text.replace(w, "🌟")
+    return text
+
+def synthesize_story(age: int, hero: str, moral: str, length: str, avoid: List[str]) -> Dict[str, Any]:
+    moral = moral or "доброта"
+    hero  = hero  or "герой"
     if oa_client:
         try:
             target_len = {"короткая":"250–400 слов","средняя":"450–700 слов","длинная":"800–1100 слов"}.get(length.lower(),"450–700 слов")
+            avoid_str = ", ".join(avoid) if avoid else "нет"
             prompt = f"""
 Ты — добрый детский автор. Напиши сказку для ребёнка {age} лет.
-Герой: {hero}. Идея/мораль: {moral}.
+Герой: {hero}. Идея/мораль: {moral}. Тем избегать: {avoid_str}.
 Требования:
 - Объём: {target_len}
 - Язык: русский, без форм "(ась)/(ёл)".
@@ -234,9 +283,11 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
 """
             resp = oa_client.responses.create(model=OPENAI_MODEL_TEXT, input=prompt)
             data = json.loads(resp.output_text or "{}")
+            text = data.get("text") or ""
+            text = _avoid_filter(text, avoid)
             return {
                 "title": data.get("title") or f"{hero.capitalize()} и урок про «{moral}»",
-                "text":  data.get("text")  or "",
+                "text":  text,
                 "moral": data.get("moral") or f"Важно помнить: {moral}. Даже маленький поступок делает мир теплее.",
                 "questions": (data.get("questions") or [
                     f"Что {hero} понял про {moral}?",
@@ -248,6 +299,7 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
         except Exception as e:
             print(f"[AI] text error: {type(e).__name__}: {e} — local fallback")
 
+    # локальный запасной вариант
     title = f"{hero.capitalize()} и урок про «{moral}»"
     paragraphs_by_len = {"короткая":3, "средняя":4, "длинная":5}
     paras = paragraphs_by_len.get(length.lower(), 4)
@@ -273,7 +325,7 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
     for _ in range(paras-2):
         parts.append(random.choice(middles))
     parts.append(random.choice(endings))
-    text = "\n\n".join(parts)
+    text = _avoid_filter("\n\n".join(parts), avoid)
 
     moral_txt = f"Важно помнить: {moral}. Даже маленький поступок делает мир теплее."
     questions = [
@@ -360,22 +412,28 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧚‍♀️ Сказка", url=f"https://t.me/{u}?start=story"),
          InlineKeyboardButton("🧮 Математика", url=f"https://t.me/{u}?start=math")],
         [InlineKeyboardButton("👪 Отчёт", url=f"https://t.me/{u}?start=parent"),
-         InlineKeyboardButton("🗑 Удалить данные", url=f"https://t.me/{u}?start=delete")],
+         InlineKeyboardButton("⚙️ Настройки", url=f"https://t.me/{u}?start=settings")],
+        [InlineKeyboardButton("🗑 Удалить данные", url=f"https://t.me/{u}?start=delete")],
     ])
 
-def menu_text() -> str:
+def menu_text(u_is_pro: bool) -> str:
+    pro = "Pro: включён ✅" if u_is_pro else "Pro: выключен"
+    lim = "без лимита (тест)" if DISABLE_LIMIT else f"лимит: {MAX_STORIES_PER_DAY}/день"
     return (
         "<b>Привет!</b>\n<b>Я — Читалкин&Циферкин 🦉➕🧮</b>\n\n"
         "• <b>Сказка</b> — подберу по возрасту и теме\n"
         "• <b>Математика</b> — 10 минут примеров\n"
         "• <b>Отчёт</b> — прогресс ребёнка\n"
+        "• <b>Настройки</b> — профиль ребёнка\n"
         "• <b>Удалить данные</b> — очистка\n\n"
-        "<i>Дневной лимит: 3 сказки. Сброс — в 00:00 (Мск).</i>"
+        f"<i>{pro} • {lim}. Сброс в 00:00 (Мск).</i>"
     )
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = get_user_stats(uid)
     await (update.effective_message or update.message).reply_html(
-        menu_text(), reply_markup=menu_keyboard(), disable_web_page_preview=True
+        menu_text(u.get("pro", False)), reply_markup=menu_keyboard(), disable_web_page_preview=True
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -389,10 +447,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if args:
         p = args[0].strip().lower()
-        if p == "story":  await story_cmd(update, context);  return
-        if p == "math":   await math_cmd(update, context);   return
-        if p == "parent": await parent_cmd(update, context); return
-        if p == "delete": await delete_cmd(update, context); return
+        if p == "story":    await story_cmd(update, context);    return
+        if p == "math":     await math_cmd(update, context);     return
+        if p == "parent":   await parent_cmd(update, context);   return
+        if p == "delete":   await delete_cmd(update, context);   return
+        if p == "settings": await settings_cmd(update, context); return
     await show_menu(update, context)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -401,86 +460,135 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_menu(update, context)
 
+# ——— SETTINGS ———
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    prof = get_profile(uid)
+    ud = context.user_data; ud.clear()
+    ud["flow"] = "settings"; ud["step"] = "age"; ud["profile"] = prof.copy()
+    await update.effective_message.reply_text(
+        f"⚙️ Настройки. Сейчас: возраст={prof['age']}, герой=«{prof['hero']}», длина={prof['length']}, избегать={', '.join(prof['avoid']) or '—'}.\n\n"
+        "Введите возраст (число от 3 до 14):"
+    )
+
+# ——— STORY ———
 async def story_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    # лимит (если включён)
     ustat = get_user_stats(uid)
-    if ustat["today_stories"] >= MAX_STORIES_PER_DAY:
+    if not DISABLE_LIMIT and ustat["today_stories"] >= MAX_STORIES_PER_DAY:
         secs = seconds_to_midnight_msk(); h = secs // 3600; m = (secs % 3600) // 60
         await update.effective_message.reply_text(
-            "На сегодня лимит сказок исчерпан 🌙 (3/день).\n"
+            "На сегодня лимит сказок исчерпан 🌙.\n"
             f"Новый день через {h} ч {m} мин по Мск."
         ); return
+
+    prof = get_profile(uid)
     ud = context.user_data; ud.clear()
-    ud["flow"] = "story"; ud["step"] = "age"; ud["params"] = {}
-    await update.effective_message.reply_text("Давай подберём сказку. Сколько лет ребёнку? (введи число)")
+    ud["flow"] = "story"; ud["step"] = "age"; ud["params"] = {"age": prof["age"], "hero": prof["hero"], "length": prof["length"]}
+    await update.effective_message.reply_text(
+        f"Давай подберём сказку. Сколько лет ребёнку? (по умолчанию {prof['age']}) — можно отправить число или свой вариант."
+    )
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ud = context.user_data
-    if ud.get("flow") != "story": return
-    step = ud.get("step"); text = (update.effective_message.text or "").strip()
+    step = ud.get("step")
+    flow = ud.get("flow")
+    if not flow: return
+    text = (update.effective_message.text or "").strip()
 
-    if step == "age":
-        ud["params"]["age"] = _safe_int(text, 6)
-        ud["step"] = "hero"
-        await update.effective_message.reply_text("Кто будет героем? (например: котёнок, ёжик, Маша)")
-        return
-
-    if step == "hero":
-        ud["params"]["hero"] = text or "герой"
-        ud["step"] = "moral"
-        await update.effective_message.reply_text("Какую идею/мораль подчеркнуть? (дружба, щедрость, смелость...)")
-        return
-
-    if step == "moral":
-        ud["params"]["moral"] = text or "доброта"
-        ud["step"] = "length"
-        await update.effective_message.reply_text("Какая длина? (короткая / средняя / длинная)")
-        return
-
-    if step == "length":
-        length = text.lower()
-        if length not in {"короткая", "средняя", "длинная"}: length = "средняя"
-        ud["params"]["length"] = length
-
-        uid = update.effective_user.id
-        ustat = get_user_stats(uid)
-        if ustat["today_stories"] >= MAX_STORIES_PER_DAY:
-            secs = seconds_to_midnight_msk(); h = secs // 3600; m = (secs % 3600) // 60
+    # SETTINGS FLOW
+    if flow == "settings":
+        prof = ud.get("profile", {})
+        if step == "age":
+            prof["age"] = _safe_int(text, prof.get("age", 6))
+            ud["step"] = "hero"
+            await update.effective_message.reply_text("Отлично! Теперь введите героя по умолчанию (например: котёнок, ёжик, Маша).")
+            return
+        if step == "hero":
+            prof["hero"] = text or prof.get("hero","герой")
+            ud["step"] = "length"
+            await update.effective_message.reply_text("Длина сказки по умолчанию? (короткая / средняя / длинная)")
+            return
+        if step == "length":
+            length = text.lower()
+            if length not in {"короткая","средняя","длинная"}: length = "средняя"
+            prof["length"] = length
+            ud["step"] = "avoid"
+            await update.effective_message.reply_text("Каких тем избегать? Напишите через запятую (или «нет»).")
+            return
+        if step == "avoid":
+            avoid = [] if text.lower() in {"нет","no","none"} else [w.strip() for w in text.split(",") if w.strip()]
+            prof["avoid"] = avoid
+            save_profile(update.effective_user.id, prof)
+            ud.clear()
             await update.effective_message.reply_text(
-                "На сегодня лимит сказок исчерпан 🌙 (3/день).\n"
-                f"Новый день через {h} ч {m} мин по Мск."
-            ); ud.clear(); return
+                f"Готово! Профиль сохранён: возраст={prof['age']}, герой=«{prof['hero']}», длина={prof['length']}, избегать={', '.join(avoid) or '—'}."
+            )
+            return
 
+    # STORY FLOW
+    if flow == "story":
         p = ud["params"]
-        data = synthesize_story(p["age"], p["hero"], p["moral"], p["length"])
-        inc_story_counters(uid, data["title"])
+        if step == "age":
+            p["age"] = _safe_int(text, p.get("age",6))
+            ud["step"] = "hero"
+            await update.effective_message.reply_text(f"Кто будет героем? (по умолчанию «{p.get('hero','герой')}»)")
+            return
+        if step == "hero":
+            p["hero"] = text or p.get("hero","герой")
+            ud["step"] = "moral"
+            await update.effective_message.reply_text("Какую идею/мораль подчеркнуть? (дружба, щедрость, смелость...)")
+            return
+        if step == "moral":
+            ud["moral"] = text or "доброта"
+            ud["step"] = "length"
+            await update.effective_message.reply_text(f"Какая длина? (короткая / средняя / длинная) — по умолчанию {p.get('length','средняя')}")
+            return
+        if step == "length":
+            length = text.lower() if text else p.get("length","средняя")
+            if length not in {"короткая","средняя","длинная"}: length = "средняя"
+            p["length"] = length
 
-        # cover → bytes
-        cover_bytes = make_cover_png_bytes(data["title"], p["hero"])
-        data["cover_png_bytes"] = cover_bytes
-        store_user_story(uid, {k: v for k, v in data.items() if k != "cover_png_bytes"})
+            uid = update.effective_user.id
+            prof = get_profile(uid)
+            # лимит (если включён)
+            ustat = get_user_stats(uid)
+            if not DISABLE_LIMIT and ustat["today_stories"] >= MAX_STORIES_PER_DAY:
+                secs = seconds_to_midnight_msk(); h = secs // 3600; m = (secs % 3600) // 60
+                await update.effective_message.reply_text(
+                    "На сегодня лимит сказок исчерпан 🌙.\n"
+                    f"Новый день через {h} ч {m} мин по Мск."
+                ); ud.clear(); return
 
-        # text
-        msg = (
-            f"🧾 {data['title']}\n\n{data['text']}\n\n"
-            f"Мораль: {data['moral']}\n\n"
-            "Вопросы:\n"
-            f"1) {data['questions'][0]}\n"
-            f"2) {data['questions'][1]}\n"
-            f"3) {data['questions'][2]}\n"
-            f"4) {data['questions'][3]}"
-        )
-        await update.effective_message.reply_text(msg)
+            data = synthesize_story(p["age"], p["hero"], ud["moral"], p["length"], avoid=get_profile(uid)["avoid"])
+            inc_story_counters(uid, data["title"])
 
-        # cover as photo
-        await update.effective_message.reply_photo(InputFile(BytesIO(cover_bytes), filename="cover.png"))
+            cover_bytes = make_cover_png_bytes(data["title"], p["hero"])
+            data["cover_png_bytes"] = cover_bytes
+            store_user_story(uid, {k: v for k, v in data.items() if k != "cover_png_bytes"})
 
-        # PDF
-        pdf_path = Path(f"skazka_{uid}.pdf").resolve()
-        render_story_pdf(pdf_path, data, cover_png=cover_bytes)
-        await update.effective_message.reply_document(InputFile(str(pdf_path), filename=pdf_path.name))
+            # text
+            msg = (
+                f"🧾 {data['title']}\n\n{data['text']}\n\n"
+                f"Мораль: {data['moral']}\n\n"
+                "Вопросы:\n"
+                f"1) {data['questions'][0]}\n"
+                f"2) {data['questions'][1]}\n"
+                f"3) {data['questions'][2]}\n"
+                f"4) {data['questions'][3]}"
+            )
+            await update.effective_message.reply_text(msg)
 
-        ud.clear(); return
+            # cover as photo
+            await update.effective_message.reply_photo(InputFile(BytesIO(cover_bytes), filename="cover.png"))
+
+            # PDF
+            pdf_path = Path(f"skazka_{uid}.pdf").resolve()
+            render_story_pdf(pdf_path, data, cover_png=cover_bytes)
+            await update.effective_message.reply_document(InputFile(str(pdf_path), filename=pdf_path.name))
+
+            ud.clear(); return
 
 # математика
 def make_math_sheet():
@@ -513,15 +621,18 @@ async def parent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: last_when = datetime.fromisoformat(last_when).astimezone(TZ_MSK).strftime("%d.%m.%Y %H:%M")
         except Exception: last_when = "—"
     else: last_when = "—"
+    prof = get_profile(uid)
     txt = (
         "👪 Отчёт родителю\n\n"
-        f"Сегодня (Мск):\n• Сказок: {u.get('today_stories',0)} / {MAX_STORIES_PER_DAY}\n\n"
+        f"Сегодня (Мск):\n• Сказок: {u.get('today_stories',0)} / {('∞' if DISABLE_LIMIT else MAX_STORIES_PER_DAY)}\n\n"
         "За всё время:\n"
         f"• Сказок: {u.get('stories_total',0)}\n"
         f"• Листов математики: {u.get('math_total',0)}\n\n"
         "Последняя сказка:\n"
         f"• {last_title}\n"
-        f"• {last_when}"
+        f"• {last_when}\n\n"
+        "Профиль ребёнка:\n"
+        f"• возраст={prof['age']}, герой=«{prof['hero']}», длина={prof['length']}, избегать={', '.join(prof['avoid']) or '—'}"
     )
     await update.effective_message.reply_text(txt)
 
@@ -532,6 +643,20 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stories_all.pop(str(uid), None); save_json(STORIES_PATH, stories_all)
     context.user_data.clear()
     await update.effective_message.reply_text("Ваши данные удалены. Можно начать заново 🙂")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# error alerts
+# ──────────────────────────────────────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ALERT_CHAT_ID:
+        print("[ERR] No ALERT_CHAT_ID; error:\n", "".join(traceback.format_exception(None, context.error, context.error.__traceback__)))
+        return
+    try:
+        tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+        text = "🚨 <b>Ошибка в боте</b>\n\n<pre>" + (tb[-3500:] if len(tb)>3500 else tb) + "</pre>"
+        await context.bot.send_message(chat_id=int(ALERT_CHAT_ID), text=text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        print("[ERR] failed to send alert:", e)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # init / run
@@ -546,6 +671,7 @@ async def post_init(app: Application):
         BotCommand("story", "умная сказка"),
         BotCommand("math",  "10 минут математики"),
         BotCommand("parent","отчёт родителю"),
+        BotCommand("settings","настройки профиля"),
         BotCommand("delete","удалить мои данные"),
         BotCommand("help",  "помощь"),
     ])
@@ -556,15 +682,20 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
+    # handlers
     app.add_handler(CommandHandler("start",  start))
     app.add_handler(CommandHandler("menu",   menu_cmd))
     app.add_handler(CommandHandler("help",   help_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("story",  story_cmd))
     app.add_handler(CommandHandler("math",   math_cmd))
     app.add_handler(CommandHandler("parent", parent_cmd))
     app.add_handler(CommandHandler("delete", delete_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
+    app.add_error_handler(error_handler)
+
+    # run
     if PUBLIC_URL:
         path = (WEBHOOK_PATH or BOT_TOKEN).lstrip("/")
         webhook_url = f"{PUBLIC_URL.rstrip('/')}/{path}"
