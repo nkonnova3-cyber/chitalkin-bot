@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Читалкин&Циферкин — сказки + PDF (Unicode) + обложка (ИИ или локальная иллюстрация)
+# Читалкин&Циферкин — сказки + PDF (Unicode) + обложка (ИИ или локальная) + webhook/polling
 
 import os, json, random, base64, tempfile, math
 from io import BytesIO
@@ -18,7 +18,9 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
-# ---------- ENV ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# ENV
+# ──────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "ВСТАВЬ_СЮДА_СВОЙ_BOT_TOKEN")
 PUBLIC_URL   = os.getenv("PUBLIC_URL")      # напр. https://chitalkin-bot.onrender.com
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")    # напр. hook
@@ -28,7 +30,9 @@ OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL_TEXT = os.getenv("OPENAI_MODEL_TEXT", "gpt-4.1-mini")
 OPENAI_MODEL_IMG  = os.getenv("OPENAI_MODEL_IMAGE", "gpt-image-1")
 
-# ---------- OpenAI (опционально) ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAI (опционально)
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from openai import OpenAI
     oa_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -36,21 +40,27 @@ except Exception as e:
     print(f"[AI] OpenAI client not available: {e}")
     oa_client = None
 
-# ---------- CONST ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# CONST / STORAGE
+# ──────────────────────────────────────────────────────────────────────────────
 MAX_STORIES_PER_DAY = 3
 TZ_MSK = ZoneInfo("Europe/Moscow")
 DATA_DIR     = Path(".")
 STATS_PATH   = DATA_DIR / "stats.json"
 STORIES_PATH = DATA_DIR / "stories.json"
 
-# ---------- FONTS ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# FONTS (обязательно положи TTF в ./fonts)
+# ──────────────────────────────────────────────────────────────────────────────
 FONT_DIR  = Path("fonts")
 FONT_REG  = FONT_DIR / "DejaVuSans.ttf"
 FONT_BOLD = FONT_DIR / "DejaVuSans-Bold.ttf"
 PDF_FONT   = "DejaVu"
 PDF_FONT_B = "DejaVuB"
 
-# ---------- helpers ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def msk_now() -> datetime: return datetime.now(TZ_MSK)
 def msk_today_str() -> str: return msk_now().strftime("%Y-%m-%d")
 def seconds_to_midnight_msk() -> int:
@@ -115,35 +125,36 @@ def store_user_story(uid: int, story: Dict[str, Any]):
     stories_all[str(uid)] = rec
     save_json(STORIES_PATH, stories_all)
 
-# ---------- AI cover ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# AI cover (если есть OPENAI_API_KEY) → bytes | None
+# ──────────────────────────────────────────────────────────────────────────────
 def gen_cover_ai(title: str) -> Optional[bytes]:
     if not oa_client:
-        print("[AI] no OpenAI client — fallback to local cover")
         return None
     try:
         prompt = (
             f"A warm, cozy children's book cover for Russian tale «{title}». "
             "Soft pastel colors, cute illustration, no text on image."
         )
-        img = oa_client.images.generate(model=OPENAI_MODEL_IMG, prompt=prompt, size="1024x1440")
-        b64 = img.data[0].b64_json
-        return base64.b64decode(b64)
+        img = oa_client.images.generate(model=os.getenv("OPENAI_MODEL_IMAGE","gpt-image-1"), prompt=prompt, size="1024x1440")
+        return base64.b64decode(img.data[0].b64_json)
     except Exception as e:
         print(f"[AI] image error: {type(e).__name__}: {e} — fallback to local cover")
         return None
 
-# ---------- NICER local cover (без ИИ) ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# Локальная красивая обложка (градиент, звёзды, «силуэт героя»)
+# ──────────────────────────────────────────────────────────────────────────────
 def _draw_gradient(draw: ImageDraw.ImageDraw, w: int, h: int):
-    top = (245, 245, 255)
-    bottom = (220, 230, 255)
+    top = (245, 245, 255); bottom = (220, 230, 255)
     for y in range(h):
         t = y / max(1, h-1)
-        r = int(top[0]   * (1-t) + bottom[0] * t)
-        g = int(top[1]   * (1-t) + bottom[1] * t)
-        b = int(top[2]   * (1-t) + bottom[2] * t)
-        draw.line([(0, y), (w, y)], fill=(r, g, b))
+        r = int(top[0]*(1-t) + bottom[0]*t)
+        g = int(top[1]*(1-t) + bottom[1]*t)
+        b = int(top[2]*(1-t) + bottom[2]*t)
+        draw.line([(0, y), (w, y)], fill=(r,g,b))
 
-def _star(draw: ImageDraw.ImageDraw, x, y, size, fill):
+def _star(draw: ImageDraw.ImageDraw, x, y, size, fill):  # простые «звёздочки»
     r = size
     for i in range(5):
         ang = i * 72 * math.pi/180
@@ -152,39 +163,24 @@ def _star(draw: ImageDraw.ImageDraw, x, y, size, fill):
         draw.ellipse((x1-2, y1-2, x1+2, y1+2), fill=fill)
 
 def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
-    # портрет A4: 1024x1440 (легко масштабируется на PDF)
     W, H = 1024, 1440
-    img = Image.new("RGB", (W, H), (255, 255, 255))
+    img = Image.new("RGB", (W, H), (255,255,255))
     d = ImageDraw.Draw(img)
 
-    # фон-градиент
     _draw_gradient(d, W, H)
-
-    # рамка с большими скруглениями
     pad = 28
-    d.rounded_rectangle((pad, pad, W-pad, H-pad), radius=28, outline=(70, 90, 200), width=6)
-
-    # ночь/луна/звезды
-    d.ellipse((W-220, 80, W-120, 180), fill=(255, 240, 200))
+    d.rounded_rectangle((pad,pad,W-pad,H-pad), radius=28, outline=(70,90,200), width=6)
+    d.ellipse((W-220, 80, W-120, 180), fill=(255,240,200))
     for sx in range(100, W-250, 140):
-        _star(d, sx, 140 + (sx//140)%70, 8, fill=(255, 255, 220))
+        _star(d, sx, 140 + (sx//140)%70, 8, fill=(255,255,220))
+    d.pieslice((-100, H-460, W+100, H+300), 0, 180, fill=(210,225,250))
 
-    # холмик
-    d.pieslice(( -100, H-460, W+100, H+300), 0, 180, fill=(210, 225, 250), outline=None)
-
-    # простой «силуэт героя»: котик/ёжик — минимализм
-    base_x = W//2 - 80
-    base_y = H - 360
-    body = [(base_x, base_y), (base_x+160, base_y), (base_x+160, base_y+120), (base_x, base_y+120)]
-    d.rounded_rectangle(body, radius=60, fill=(90, 110, 160))
-    # ушки
-    d.polygon([(base_x+20, base_y), (base_x+60, base_y-40), (base_x+80, base_y)],
-              fill=(90,110,160))
-    d.polygon([(base_x+140, base_y), (base_x+100, base_y-40), (base_x+80, base_y)],
-              fill=(90,110,160))
-    # хвост
-    d.rounded_rectangle((base_x+150, base_y+40, base_x+190, base_y+60),
-                        radius=10, fill=(90,110,160))
+    # «герой»
+    base_x, base_y = W//2 - 80, H - 360
+    d.rounded_rectangle((base_x, base_y, base_x+160, base_y+120), radius=60, fill=(90,110,160))
+    d.polygon([(base_x+20, base_y), (base_x+60, base_y-40), (base_x+80, base_y)], fill=(90,110,160))
+    d.polygon([(base_x+140, base_y), (base_x+100, base_y-40), (base_x+80, base_y)], fill=(90,110,160))
+    d.rounded_rectangle((base_x+150, base_y+40, base_x+190, base_y+60), radius=10, fill=(90,110,160))
 
     # заголовок
     title = (title or "Сказка").strip()
@@ -193,10 +189,8 @@ def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
     except Exception:
         font_title = ImageFont.load_default()
 
-    # перенос по ширине
-    max_w = W - 2*80
-    words = title.split()
-    lines, cur = [], ""
+    max_w = W - 160
+    words = title.split(); lines, cur = [], ""
     for w in words:
         test = (cur + " " + w).strip()
         if d.textlength(test, font=font_title) <= max_w:
@@ -207,7 +201,6 @@ def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
     if cur: lines.append(cur)
     if not lines: lines = [title]
 
-    # центрируем блок заголовка
     total_h = 0
     for ln in lines:
         bb = d.textbbox((0,0), ln, font=font_title)
@@ -215,25 +208,21 @@ def gen_cover_local(title: str, hero_hint: str = "") -> bytes:
     y = H//2 - total_h//2 - 80
     for ln in lines:
         bb = d.textbbox((0,0), ln, font=font_title)
-        line_w = bb[2] - bb[0]
-        x = (W - line_w)//2
+        x = (W - (bb[2]-bb[0])) // 2
         d.text((x, y), ln, font=font_title, fill=(35, 40, 60))
         y += (bb[3]-bb[1]) + 8
 
-    bio = BytesIO()
-    img.save(bio, format="PNG")
-    bio.seek(0)
+    bio = BytesIO(); img.save(bio, format="PNG"); bio.seek(0)
     return bio.getvalue()
 
 def make_cover_png_bytes(title: str, hero: str) -> bytes:
     raw = gen_cover_ai(title)
-    if raw is not None:
-        return raw
-    return gen_cover_local(title, hero_hint=hero)
+    return raw if raw is not None else gen_cover_local(title, hero_hint=hero)
 
-# ---------- STORY (ИИ или локально, НОРМАЛЬНЫЕ ФРАЗЫ) ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# STORY (ИИ или локально — чистый русский текст, без «(ась)/(ёл)»)
+# ──────────────────────────────────────────────────────────────────────────────
 def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, Any]:
-    # 1) пробуем ИИ
     if oa_client:
         try:
             target_len = {"короткая":"250–400 слов","средняя":"450–700 слов","длинная":"800–1100 слов"}.get(length.lower(),"450–700 слов")
@@ -242,17 +231,16 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
 Герой: {hero}. Идея/мораль: {moral}.
 Требования:
 - Объём: {target_len}
-- Язык: русский, без форм «(ась)», «(ёл)» и т.п.
+- Язык: русский, никакой записи вида "(ась)/(ёл)" — нормальные формы слов.
 - 3–5 коротких абзацев + отдельный блок «Мораль»
 - Затем 4 вопроса для обсуждения
-Ответ строго в JSON с полями: title, text, moral, questions (ровно 4 строки).
+Ответ строго в JSON: {{ "title": "...", "text": "...", "moral": "...", "questions": ["...", "...", "...", "..."] }}
 """
-            resp = oa_client.responses.create(model=OPENAI_MODEL_TEXT, input=prompt)
-            raw = resp.output_text or ""
-            data = json.loads(raw)
+            resp = oa_client.responses.create(model=os.getenv("OPENAI_MODEL_TEXT","gpt-4.1-mini"), input=prompt)
+            data = json.loads(resp.output_text or "{}")
             return {
                 "title": data.get("title") or f"{hero.capitalize()} и урок про «{moral}»",
-                "text":  data.get("text") or "",
+                "text":  data.get("text")  or "",
                 "moral": data.get("moral") or f"Важно помнить: {moral}. Даже маленький поступок делает мир теплее.",
                 "questions": (data.get("questions") or [
                     f"Что {hero} понял про {moral}?",
@@ -264,7 +252,6 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
         except Exception as e:
             print(f"[AI] text error: {type(e).__name__}: {e} — local fallback")
 
-    # 2) локально — НИКАКИХ «(ась)» и т.п., аккуратные фразы
     title = f"{hero.capitalize()} и урок про «{moral}»"
     paragraphs_by_len = {"короткая":3, "средняя":4, "длинная":5}
     paras = paragraphs_by_len.get(length.lower(), 4)
@@ -301,29 +288,36 @@ def synthesize_story(age: int, hero: str, moral: str, length: str) -> Dict[str, 
     ]
     return {"title": title, "text": text, "moral": moral_txt, "questions": questions}
 
-# ---------- PDF ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# PDF
+# ──────────────────────────────────────────────────────────────────────────────
 class StoryPDF(FPDF):
     def header(self): pass
 
 def _ensure_unicode_fonts(pdf: FPDF) -> bool:
-    have = FONT_REG.exists() and FONT_BOLD.exists()
-    if have:
-        try:
-            pdf.add_font(PDF_FONT,   "", str(FONT_REG),  uni=True)
-            pdf.add_font(PDF_FONT_B, "", str(FONT_BOLD), uni=True)
-            return True
-        except Exception as e:
-            print(f"[PDF] TTF load error: {e} — fallback to Helvetica")
-    else:
-        print("[PDF] WARNING: fonts/DejaVuSans*.ttf not found")
-    return False
+    try:
+        print(f"[PDF] fonts dir: {FONT_DIR.resolve()}")
+        if not FONT_DIR.exists():
+            print("[PDF] fonts/ directory NOT found")
+            return False
+        print(f"[PDF] contents: {list(p.name for p in FONT_DIR.iterdir())}")
+        if not (FONT_REG.exists() and FONT_BOLD.exists()):
+            print("[PDF] DejaVu TTF files NOT found (need DejaVuSans.ttf & DejaVuSans-Bold.ttf)")
+            return False
+        pdf.add_font(PDF_FONT,   "", str(FONT_REG),  uni=True)
+        pdf.add_font(PDF_FONT_B, "", str(FONT_BOLD), uni=True)
+        print("[PDF] loaded Unicode fonts: OK")
+        return True
+    except Exception as e:
+        print(f"[PDF] TTF load error: {e} — fallback to Helvetica")
+        return False
 
 def render_story_pdf(path: Path, data: Dict[str, Any], cover_png: Optional[bytes]):
     pdf = StoryPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     use_uni = _ensure_unicode_fonts(pdf)
 
-    # cover
+    # COVER
     pdf.add_page()
     if cover_png:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -339,7 +333,7 @@ def render_story_pdf(path: Path, data: Dict[str, Any], cover_png: Optional[bytes
         else:       pdf.set_font("Helvetica", style="B", size=26)
         pdf.set_y(40); pdf.multi_cell(0, 12, data["title"], align="C")
 
-    # text page
+    # TEXT page
     pdf.add_page()
     if use_uni: pdf.set_font(PDF_FONT_B, size=16)
     else:       pdf.set_font("Helvetica", style="B", size=16)
@@ -366,7 +360,9 @@ def render_story_pdf(path: Path, data: Dict[str, Any], cover_png: Optional[bytes
 
     pdf.output(str(Path(path)))
 
-# ---------- UI ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────────────────────────────────────────
 BOT_USERNAME: Optional[str] = None
 
 def menu_keyboard() -> InlineKeyboardMarkup:
@@ -375,8 +371,10 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🧚‍♀️ Сказка", url=f"https://t.me/{u}?start=story"),
          InlineKeyboardButton("🧮 Математика", url=f"https://t.me/{u}?start=math")],
         [InlineKeyboardButton("👪 Отчёт", url=f"https://t.me/{u}?start=parent"),
-         InlineKeyboardButton("🗑 Удалить данные", url=f"https://t.me/{u}?start=delete")],
+         InlineKeyboardButton("🗑 Удалить данные", url=f=https_url(f"https://t.me/{u}?start=delete"))],
     ])
+
+def https_url(u: str) -> str: return u  # заглушка на случай линтеров
 
 def menu_text() -> str:
     return (
@@ -393,7 +391,9 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         menu_text(), reply_markup=menu_keyboard(), disable_web_page_preview=True
     )
 
-# ---------- commands ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# commands / flow
+# ──────────────────────────────────────────────────────────────────────────────
 def _safe_int(text: str, default: int) -> int:
     try: return max(3, min(14, int(text)))
     except Exception: return default
@@ -546,7 +546,9 @@ async def delete_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.effective_message.reply_text("Ваши данные удалены. Можно начать заново 🙂")
 
-# ---------- init ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# init / run
+# ──────────────────────────────────────────────────────────────────────────────
 async def post_init(app: Application):
     global BOT_USERNAME
     me = await app.bot.get_me()
