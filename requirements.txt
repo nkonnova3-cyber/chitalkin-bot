@@ -3,5 +3,3 @@ aiohttp
 fpdf2
 pillow
 openai>=1.40.0
-openai>=1.40.0
-pillow
